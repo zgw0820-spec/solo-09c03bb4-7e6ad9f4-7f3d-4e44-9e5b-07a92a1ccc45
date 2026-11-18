@@ -14,6 +14,14 @@
 4. 同名重建会使 generation +1, 旧代续租无法影响新槽。
 5. 崩溃恢复: tombstone 已提交但槽未删(服务重启/崩溃)时, 再次回收会沿着
    已有的 'reclaimed' tombstone 继续完成删除, 状态始终来自数据库实况。
+6. 写入准入(WAL 软阈值): 阈值按代次存于租约行 wal_threshold_bytes。
+   /api/demo/write 在同一事务内先 SELECT ... FOR UPDATE 锁住租约行
+   (与并发写入/设阈值/回收/同名重建串行化), 再用新语句按数据库实况测量
+   保留字节: 达阈值或不可核实(槽缺失/保留量 NULL/库故障)时整批拒绝,
+   一行不落; 等待行锁的下一批在持锁后按新实况重判。同名重建(新一代)
+   重置阈值为 NULL, 回收 tombstone 清除阈值(回滚时按原样恢复),
+   未设置阈值时维持原有写入行为。准入只约束 /api/demo/write,
+   续租/回收等其他操作不受影响。
 """
 from __future__ import annotations
 
@@ -61,7 +69,7 @@ WHERE s.slot_name = %(n)s
 """
 
 LEASE_SQL = """
-SELECT generation, state, expires_at, updated_at,
+SELECT generation, state, expires_at, updated_at, wal_threshold_bytes,
        (expires_at <= clock_timestamp()) AS expired,
        (extract(epoch FROM (expires_at - clock_timestamp())) * 1000)::bigint AS remaining_ms
 FROM cdc_slot_lease
@@ -80,7 +88,7 @@ RETURNING generation, expires_at,
 
 # 回收第 1 步: 事务内行锁 + 原子 tombstone(租约过期 或 崩溃遗留 tombstone 才允许)。
 TOMBSTONE_LOCK_SQL = """
-SELECT generation, state, expires_at,
+SELECT generation, state, expires_at, wal_threshold_bytes,
        (expires_at <= clock_timestamp()) AS expired,
        (extract(epoch FROM (expires_at - clock_timestamp())) * 1000)::bigint AS remaining_ms
 FROM cdc_slot_lease
@@ -88,30 +96,62 @@ WHERE slot_name = %(n)s
 FOR UPDATE
 """
 
+# tombstone 同时清除本代阈值: 阻断结论不随回收残留, 更不带入下一代。
 TOMBSTONE_SQL = """
 UPDATE cdc_slot_lease
-SET state = 'reclaimed', updated_at = clock_timestamp()
+SET state = 'reclaimed', wal_threshold_bytes = NULL, updated_at = clock_timestamp()
 WHERE slot_name = %(n)s
 """
 
-# 回收失败回滚: 仅当我们本次把 active 改成了 reclaimed 才回滚, 且必须同代。
+# 回收失败回滚: 仅当我们本次把 active 改成了 reclaimed 才回滚, 且必须同代;
+# 阈值一并按原样恢复, 不得因回收失败而丢失值班员设置的阈值。
 REVERT_SQL = """
 UPDATE cdc_slot_lease
-SET state = 'active', expires_at = %(old_expires)s, updated_at = clock_timestamp()
+SET state = 'active', expires_at = %(old_expires)s,
+    wal_threshold_bytes = %(old_threshold)s, updated_at = clock_timestamp()
 WHERE slot_name = %(n)s AND generation = %(g)s AND state = 'reclaimed'
 """
 
-# 创建: 同名重建时 generation 单调 +1, 旧代 fencing token 立即失效。
+# 创建: 同名重建时 generation 单调 +1, 旧代 fencing token 立即失效;
+# 新代阈值重置为 NULL —— 不继承旧代的阈值或阻断结论。
 LEASE_UPSERT_SQL = """
-INSERT INTO cdc_slot_lease (slot_name, generation, state, expires_at, updated_at)
+INSERT INTO cdc_slot_lease (slot_name, generation, state, expires_at, updated_at,
+                            wal_threshold_bytes)
 VALUES (%(n)s, 1, 'active',
-        clock_timestamp() + make_interval(secs => %(secs)s), clock_timestamp())
+        clock_timestamp() + make_interval(secs => %(secs)s), clock_timestamp(), NULL)
 ON CONFLICT (slot_name) DO UPDATE
 SET generation = cdc_slot_lease.generation + 1,
     state      = 'active',
     expires_at = clock_timestamp() + make_interval(secs => %(secs)s),
-    updated_at = clock_timestamp()
+    updated_at = clock_timestamp(),
+    wal_threshold_bytes = NULL
 RETURNING generation, expires_at
+"""
+
+# 设置/清除软阈值: 单条原子 UPDATE —— 行锁使设阈值与写入/回收/重建串行化,
+# 仅当前活跃代(state='active')可设置, 阈值跟随该行所代表的代次。
+THRESHOLD_SET_SQL = """
+UPDATE cdc_slot_lease
+SET wal_threshold_bytes = %(t)s, updated_at = clock_timestamp()
+WHERE slot_name = %(n)s AND state = 'active'
+RETURNING generation, wal_threshold_bytes
+"""
+
+# 写入准入第 1 步: 行锁租约记录。并发 demo 写入在此串行; 与设阈值(UPDATE)、
+# 回收 tombstone(FOR UPDATE)、同名重建(UPSERT) 的交错也在此分出先后。
+ADMIT_LOCK_SQL = """
+SELECT generation, state, wal_threshold_bytes
+FROM cdc_slot_lease
+WHERE slot_name = %(n)s
+FOR UPDATE
+"""
+
+# 写入准入第 2 步: 持锁后用新语句测量(READ COMMITTED 下取新快照),
+# 保证等待锁的批次按最新实况重判, 而非沿用排队前的旧读数。
+RETAINED_SQL = """
+SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), s.restart_lsn)::bigint AS retained_bytes
+FROM pg_replication_slots AS s
+WHERE s.slot_name = %(n)s
 """
 
 WRITE_SQL = """
@@ -127,8 +167,14 @@ DDL = [
         generation bigint NOT NULL,
         state      text NOT NULL CHECK (state IN ('active', 'reclaimed')),
         expires_at timestamptz NOT NULL,
-        updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+        updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+        wal_threshold_bytes bigint
     )
+    """,
+    # 既有库的就地迁移(幂等): 为租约行补充按代次生效的 WAL 软阈值列。
+    """
+    ALTER TABLE cdc_slot_lease
+    ADD COLUMN IF NOT EXISTS wal_threshold_bytes bigint
     """,
     """
     CREATE TABLE IF NOT EXISTS demo_events (
@@ -170,6 +216,34 @@ def lease_view(lease: dict | None) -> dict | None:
     }
 
 
+def admission_view(lease: dict | None, slot: dict | None) -> dict:
+    """写入准入实况(仅展示/判定用, 权威判定在 /api/demo/write 事务内)。
+
+    规则: 当前代租约(state='active')设置了阈值才适用; 适用时若槽缺失或
+    保留量不可核实, 一律视为不放行(故障自闭), 恢复后由实况重新判定。
+    """
+    retained = slot.get("retained_bytes") if slot else None
+    base = {
+        "generation": lease["generation"] if lease else None,
+        "retained_bytes": retained,
+    }
+    if not (lease and lease["state"] == "active"
+            and lease["wal_threshold_bytes"] is not None):
+        return {**base, "applicable": False, "allowed": True,
+                "reason": "no_threshold", "threshold_bytes": None}
+    threshold = lease["wal_threshold_bytes"]
+    if not slot:
+        allowed, reason = False, "slot_unverifiable"
+    elif retained is None:
+        allowed, reason = False, "retained_unverifiable"
+    elif retained >= threshold:
+        allowed, reason = False, "threshold_reached"
+    else:
+        allowed, reason = True, "under_threshold"
+    return {**base, "applicable": True, "allowed": allowed, "reason": reason,
+            "threshold_bytes": threshold}
+
+
 def build_status() -> dict:
     try:
         with db_connect(autocommit=True) as conn:
@@ -184,6 +258,7 @@ def build_status() -> dict:
             "error": f"{type(exc).__name__}: {exc}",
             "slot_name": SLOT_NAME,
             "lease_seconds": LEASE_SECONDS,
+            "admission": None,
         }
     return {
         "ok": True,
@@ -194,6 +269,7 @@ def build_status() -> dict:
         "server_time": server_time.isoformat(),
         "slot": slot_view(slot),
         "lease": lease_view(lease),
+        "admission": admission_view(lease, slot),
         "demo_events": events,
     }
 
@@ -409,7 +485,8 @@ def api_reclaim():
                 conn.execute(
                     REVERT_SQL,
                     {"n": SLOT_NAME, "g": old["generation"],
-                     "old_expires": old["expires_at"]},
+                     "old_expires": old["expires_at"],
+                     "old_threshold": old["wal_threshold_bytes"]},
                 )
             steps.append({"step": "revert_tombstone", "ok": True,
                           "detail": "已按原样回滚租约标记"})
@@ -486,15 +563,103 @@ def api_reclaim():
     )
 
 
+class ThresholdIn(BaseModel):
+    # None 表示清除阈值(恢复原有写入行为); 非负整数为软阈值字节数。
+    threshold_bytes: int | None = Field(default=None, ge=0)
+
+
+@app.post("/api/slot/threshold")
+def api_threshold(body: ThresholdIn):
+    """为当前代租约设置/清除保留 WAL 软阈值。
+
+    阈值跟随租约代次: 同名重建的新一代不继承; 仅 state='active' 的租约
+    可设置(过期未回收的失联租约仍是 'active', 正是需要限流的情形)。
+    """
+    try:
+        with db_connect() as conn:
+            row = conn.execute(
+                THRESHOLD_SET_SQL, {"n": SLOT_NAME, "t": body.threshold_bytes}
+            ).fetchone()
+            if row is None:
+                cur = conn.execute(LEASE_SQL, {"n": SLOT_NAME}).fetchone()
+                if cur is None:
+                    reason, detail = "no_lease", "租约不存在(槽未创建?)"
+                else:
+                    reason, detail = (
+                        "lease_reclaimed",
+                        "租约已回收, 不能为已回收代设置阈值",
+                    )
+                return jresp(
+                    {"ok": False, "error": "threshold_rejected", "reason": reason,
+                     "detail": detail, "lease": lease_view(cur),
+                     "status": build_status()},
+                    status_code=409,
+                )
+    except Exception as exc:
+        return db_unavailable(exc)
+
+    return jresp(
+        {"ok": True, "generation": row["generation"],
+         "threshold_bytes": row["wal_threshold_bytes"],
+         "cleared": body.threshold_bytes is None,
+         "status": build_status()}
+    )
+
+
 class WriteIn(BaseModel):
     rows: int = Field(default=100, ge=1, le=100000)
 
 
 @app.post("/api/demo/write")
 def api_write(body: WriteIn):
-    """模拟业务写入(产生 WAL)。与槽状态无关, 任何时候都可执行。"""
+    """模拟业务写入(产生 WAL)。
+
+    准入规则(仅当当前代租约设置了 WAL 软阈值时适用):
+      1. 事务内 SELECT ... FOR UPDATE 锁住租约行 —— 并发写入、设阈值、
+         回收、同名重建都在此串行, 准入对应实际写入时的代次与阈值;
+      2. 持锁后用新语句实测保留字节 —— 排队等待的批次按新实况重判;
+      3. 保留量已达阈值, 或槽缺失/保留量不可核实 -> 整批拒绝, 一行不落;
+      4. 数据库故障 -> 503, 不放行; 未设置阈值 -> 维持原有写入行为。
+    """
     try:
         with db_connect() as conn:
+            lease = conn.execute(ADMIT_LOCK_SQL, {"n": SLOT_NAME}).fetchone()
+            if (
+                lease
+                and lease["state"] == "active"
+                and lease["wal_threshold_bytes"] is not None
+            ):
+                threshold = lease["wal_threshold_bytes"]
+                row = conn.execute(RETAINED_SQL, {"n": SLOT_NAME}).fetchone()
+                retained = row["retained_bytes"] if row else None
+                if row is None:
+                    reason, detail = (
+                        "slot_unverifiable",
+                        "复制槽不存在, 保留量不可核实",
+                    )
+                elif retained is None:
+                    reason, detail = (
+                        "retained_unverifiable",
+                        "保留 WAL 字节数不可核实",
+                    )
+                elif retained >= threshold:
+                    reason, detail = (
+                        "threshold_exceeded",
+                        f"保留 WAL {retained} B 已达软阈值 {threshold} B",
+                    )
+                else:
+                    reason, detail = None, None
+                if reason is not None:
+                    conn.rollback()  # 整批不落行, 立即放行行锁
+                    return jresp(
+                        {"ok": False, "error": "write_rejected", "reason": reason,
+                         "detail": f"写入准入拒绝: {detail}(整批未落行)",
+                         "inserted": 0, "generation": lease["generation"],
+                         "threshold_bytes": threshold,
+                         "retained_bytes": retained,
+                         "status": build_status()},
+                        status_code=409,
+                    )
             cur = conn.execute(WRITE_SQL, {"n": body.rows})
             inserted = cur.rowcount
             total = conn.execute("SELECT count(*) AS c FROM demo_events").fetchone()["c"]

@@ -45,5 +45,25 @@ services:
       db:
         condition: service_healthy
 
+  # 可选的第二个服务进程: 演示两个应用进程并行写入时,
+  # WAL 软阈值准入仍由数据库行锁保证一致(等待的批次按新实况重判)。
+  # 启用: docker compose --profile ha up --build   (网页: http://localhost:8001)
+  app2:
+    build: ./app
+    profiles: ["ha"]
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGDATABASE: appdb
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      SLOT_NAME: cdc_demo_slot
+      LEASE_SECONDS: "5"
+    ports:
+      - "8001:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
 volumes:
   pgdata:

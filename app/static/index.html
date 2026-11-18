@@ -48,6 +48,8 @@
            padding: 12px 16px; margin-bottom: 16px; font-size: 13px; color: var(--dim); }
   .tools input[type=number] { width: 90px; background: var(--bg); color: var(--fg);
            border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; font-family: var(--mono); }
+  .tools select { background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+           border-radius: 6px; padding: 5px 6px; font-family: var(--mono); }
   .tools b { color: var(--fg); font-family: var(--mono); }
   #log { background: #0b0f18; border: 1px solid var(--line); border-radius: 10px;
          padding: 10px 12px; height: 300px; overflow: auto; font-family: var(--mono); font-size: 12px; }
@@ -61,7 +63,7 @@
 <body>
 <header>
   <h1>CDC 复制槽回收值班台</h1>
-  <div class="sub">PostgreSQL 16 逻辑复制槽 · 失联消费者回收 · 5 秒租约 + 代次 fencing · 状态以数据库实况为准</div>
+  <div class="sub">PostgreSQL 16 逻辑复制槽 · 失联消费者回收 · 5 秒租约 + 代次 fencing · WAL 软阈值写入准入 · 状态以数据库实况为准</div>
 </header>
 <main>
   <div id="banner" class="banner"></div>
@@ -76,6 +78,11 @@
       <table class="kv"><tbody id="leaseBody"></tbody></table>
       <div class="leasebar" id="leaseBar"><div id="leaseFill" style="width:0%"></div></div>
       <div class="muted" id="leaseHint"></div>
+    </div>
+    <div class="card">
+      <h2>写入准入（WAL 软阈值，按代次生效）</h2>
+      <table class="kv"><tbody id="admitBody"></tbody></table>
+      <div class="muted" id="admitHint"></div>
     </div>
   </div>
 
@@ -93,6 +100,21 @@
     用指定代续租 → <input type="number" id="genInput" min="1" placeholder="代次">
     <button id="btnRenewGen">发送旧代续租</button>
     <span class="muted">（回收成功后或同名重建后，旧代续租应被拒绝；回收/重建前请先在 5 秒内操作以观察“续租先成功则不得删除”）</span>
+  </div>
+
+  <div class="tools">
+    WAL 软阈值：
+    <input type="number" id="thrInput" min="0" step="any" placeholder="数值">
+    <select id="thrUnit">
+      <option value="1">B</option>
+      <option value="1024">KiB</option>
+      <option value="1048576" selected>MiB</option>
+      <option value="1073741824">GiB</option>
+    </select>
+    <button id="btnSetThr">设置阈值</button>
+    <button id="btnClrThr">清除阈值</button>
+    <span class="muted">（仅作用于当前代：实测保留 WAL 达阈值后，② 的 demo 写入整批拒绝、一行不落；
+      清除后或未设置时恢复放行；同名重建的新一代不继承阈值）</span>
   </div>
 
   <h2 class="sec">操作日志</h2>
@@ -146,6 +168,8 @@ function render(st) {
     banner.classList.add('show');
     $('slotBody').innerHTML = row('数据库', badge('不可达', 'b-bad'));
     $('leaseBody').innerHTML = row('租约', badge('未知', 'b-dim'));
+    $('admitBody').innerHTML = row('写入准入', badge('未知（数据库不可达）', 'b-dim'));
+    $('admitHint').textContent = '已设阈值的写入在数据库故障时不会被放行。';
     leaseRemaining = null;
     return;
   }
@@ -193,6 +217,36 @@ function render(st) {
       : '租约已回收：旧代续租将被拒绝；同名重建会签发新一代';
   }
   $('leaseBody').innerHTML = h;
+
+  // ---- admission (WAL 软阈值) ----
+  const a = st.admission;
+  h = '';
+  if (!a) {
+    h += row('写入准入', badge('未知', 'b-dim'));
+    $('admitHint').textContent = '';
+  } else {
+    h += row('软阈值', a.applicable
+      ? `<b>${esc(fmtBytes(a.threshold_bytes))}</b>`
+      : '<span class="muted">未设置（demo 写入不受限）</span>');
+    h += row('实测保留 WAL', a.retained_bytes === null || a.retained_bytes === undefined
+      ? '<span class="muted">不可核实</span>' : `<b>${esc(fmtBytes(a.retained_bytes))}</b>`);
+    h += row('适用代次', a.generation === null || a.generation === undefined ? '—' : `<b>${a.generation}</b>`);
+    const reasons = {
+      no_threshold:        ['放行（未设置阈值）', 'b-ok'],
+      under_threshold:     ['放行（未达阈值）', 'b-ok'],
+      threshold_reached:   ['拒绝（保留量已达阈值）', 'b-bad'],
+      slot_unverifiable:   ['拒绝（槽缺失，保留量不可核实）', 'b-bad'],
+      retained_unverifiable: ['拒绝（保留量不可核实）', 'b-bad'],
+    };
+    const rc = reasons[a.reason] || [a.reason, 'b-dim'];
+    h += row('demo 写入准入', badge(rc[0], rc[1]));
+    $('admitHint').textContent = !a.applicable
+      ? '未设置阈值：写入维持原有行为。'
+      : (a.allowed
+        ? '受理前实测未达阈值：demo 写入放行。'
+        : '已达阈值或不可核实：demo 写入整批拒绝；续租、回收等其他操作不受影响。');
+  }
+  $('admitBody').innerHTML = h;
 }
 
 function tick() {
@@ -245,6 +299,13 @@ $('btnReclaim').onclick = () => {
   if (!confirm('确认回收？\n仅当租约已过期且数据库确认槽未被使用时才会真正删除。')) return;
   act('确认回收', '/api/slot/reclaim');
 };
+$('btnSetThr').onclick = () => {
+  const v = parseFloat($('thrInput').value);
+  if (!(v >= 0)) { log('err', '✘ 请输入非负数值'); return; }
+  const bytes = Math.round(v * parseInt($('thrUnit').value, 10));
+  act(`设置 WAL 软阈值 ${bytes} B`, '/api/slot/threshold', { threshold_bytes: bytes });
+};
+$('btnClrThr').onclick = () => act('清除 WAL 软阈值', '/api/slot/threshold', { threshold_bytes: null });
 $('btnRefresh').onclick = refresh;
 
 setInterval(() => { if ($('auto').checked) refresh(); }, 1000);

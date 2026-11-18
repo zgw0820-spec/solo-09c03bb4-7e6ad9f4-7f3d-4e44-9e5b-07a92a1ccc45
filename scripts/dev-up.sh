@@ -11,7 +11,7 @@ APP_DIR="$(cd "$(dirname "$0")/../app" && pwd)"
 
 if [[ "${1:-}" == "--reset" ]]; then
   "$PGBIN/pg_ctl" -D "$PGDATA" -m immediate stop >/dev/null 2>&1 || true
-  pkill -f 'uvicorn main:app' 2>/dev/null || true
+  pkill -f 'uvicorn main:app --host 0.0.0.0 --port' 2>/dev/null || true
   rm -rf "$PGDATA"
 fi
 
@@ -29,7 +29,7 @@ fi
 "$PGBIN/pg_ctl" -D "$PGDATA" -l "$RT/pg.log" -w -t 60 start >/dev/null
 "$PGBIN/createdb" -h 127.0.0.1 -p "$PGPORT" -U postgres appdb 2>/dev/null || true
 
-pkill -f 'uvicorn main:app' 2>/dev/null || true
+pkill -f 'uvicorn main:app --host 0.0.0.0 --port 8000' 2>/dev/null || true
 sleep 1
 cd "$APP_DIR"
 PGHOST=127.0.0.1 PGPORT="$PGPORT" PGDATABASE=appdb PGUSER=postgres PGPASSWORD=postgres \

@@ -1,16 +1,19 @@
 # CDC 复制槽回收值班台
 
 值班员用于回收**失联 CDC 消费者**占用的 PostgreSQL 逻辑复制槽的操作网页，避免 WAL 持续堆积。
+消费者失联期间槽仍保留 WAL，网页可为当前槽代设置**保留 WAL 软阈值**，限制随后的演示写入，
+防止积压继续扩大。
 
 - 数据库：PostgreSQL 16（`wal_level=logical`）
 - 服务：FastAPI + psycopg 3（同步驱动），单页操作界面（原生 JS）
-- 编排：Docker Compose（`db` + `app` 两个服务）
+- 编排：Docker Compose（`db` + `app` 两个服务；`--profile ha` 可再启一个 `app2` 演示多进程）
 
 ## 快速开始
 
 ```bash
 docker compose up --build
 # 网页: http://localhost:8000
+# 可选第二进程: docker compose --profile ha up --build  →  http://localhost:8001
 ```
 
 网页上可执行：
@@ -18,12 +21,31 @@ docker compose up --build
 | 操作 | 说明 |
 |---|---|
 | ① 创建演示槽 | 创建逻辑复制槽 `cdc_demo_slot`（pgoutput）并签发 5 秒租约 |
-| ② 模拟写入 | 向 `demo_events` 写 100 行，产生 WAL（任何时候都可执行） |
+| ② 模拟写入 | 向 `demo_events` 写 100 行，产生 WAL（受软阈值准入约束） |
 | ③ 续租 | 模拟消费者心跳，租约延长 5 秒（携带 fencing 代次） |
 | ④ 确认回收 | 仅当**租约过期**且**数据库确认槽未被使用**时才真正删除 |
+| ⑤ 设置/清除 WAL 软阈值 | 为**当前代**租约设置保留 WAL 上限（字节）；清除后恢复放行 |
 
 界面实时显示：实际保留 WAL 字节数（`pg_current_wal_lsn() - restart_lsn`）、未确认字节数、
-数据库是否正在使用该槽（`active`/`active_pid`）、租约状态/代次/倒计时。
+数据库是否正在使用该槽（`active`/`active_pid`）、租约状态/代次/倒计时，
+以及**写入准入状态**（阈值、实测字节、放行/拒绝及原因）。
+
+## 写入准入（WAL 软阈值）语义
+
+阈值持久化在租约行 `wal_threshold_bytes`，**跟随代次**：
+
+1. **受理前判定**：`/api/demo/write` 在同一事务内先 `SELECT ... FOR UPDATE` 锁住租约行，
+   再用新语句实测保留字节（READ COMMITTED 新快照）。已达阈值 → **整批拒绝（409），一行不落**。
+2. **并发重判**：行锁使并发写入串行；单批首次越线提交后，排队等待的下一批持锁后
+   **按新实况重判**，必然看到越线后的字节数而拒绝。锁在数据库里，与进程数无关
+   （`--profile ha` 起两个进程同样成立）。
+3. **交错一致**：设阈值（`UPDATE`）、回收（tombstone）、同名重建（`UPSERT`）都要写同一行，
+   与写入的行锁天然串行 → 准入始终对应**实际写入时的代次与阈值**。
+4. **代次隔离**：同名重建使 `generation+1` 且阈值重置为 `NULL`——新代**不继承**旧代的
+   阈值或阻断结论；回收 tombstone 时清除阈值（回收失败回滚时按原样恢复）。
+5. **故障自闭**：已设阈值时，槽缺失、保留量不可核实或数据库故障 → **不放行**（409/503）；
+   恢复后按实况重新判定。未设置阈值时维持原有写入行为。
+6. 准入只约束 `/api/demo/write`；续租、回收等其他操作不受影响。
 
 ## 安全设计（全部以数据库实况为准）
 
@@ -44,11 +66,12 @@ docker compose up --build
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/status` | 槽/租约/WAL 实况；库不可达时 `db_ok:false` |
-| POST | `/api/slot/create` | 建槽 + 签发新一代租约；已存在返回 409 |
+| GET | `/api/status` | 槽/租约/WAL/准入实况；库不可达时 `db_ok:false` |
+| POST | `/api/slot/create` | 建槽 + 签发新一代租约（阈值重置）；已存在返回 409 |
 | POST | `/api/slot/renew` | `{generation}` 续租；拒绝返回 409 + 原因 |
 | POST | `/api/slot/reclaim` | 回收；返回逐步骤日志与最终实况 |
-| POST | `/api/demo/write` | `{rows}` 模拟业务写入 |
+| POST | `/api/slot/threshold` | `{threshold_bytes}` 设置/清除（`null`）当前代软阈值 |
+| POST | `/api/demo/write` | `{rows}` 模拟业务写入；达阈值/不可核实返回 409 且整批不落行 |
 
 ## 模拟“数据库正在使用槽”
 
@@ -61,10 +84,14 @@ docker compose exec db pg_recvlogical -U postgres -d appdb \
 
 ## 自测
 
-`tests/selftest.py`（44 项断言：交错、同名重建、active 拒绝、崩溃恢复、服务重启、
-WAL 增长、失败后可写）与 `tests/race_test.py`（续租/回收真并发压测）。
-两者仅依赖 Python 标准库，通过 `BASE_URL` 指向服务即可运行；
-`APP_RESTART_CMD` 可提供应用重启命令以启用重启用例。
+`tests/selftest.py`（70+ 项断言：交错、同名重建、active 拒绝、崩溃恢复、服务重启、
+WAL 增长、失败后可写，以及软阈值的设置/越线整批拒绝/并发重判/故障自闭/代次隔离）、
+`tests/race_test.py`（续租/回收真并发压测）与
+`tests/admission_race.py`（并发写入准入压测：越线后等待批次按新实况被拒）。
+均仅依赖 Python 标准库，通过 `BASE_URL` 指向服务即可运行；
+`BASE_URL_2` 可指定第二服务进程以验证多进程并行写入；
+`APP_RESTART_CMD` 提供应用重启命令以启用重启用例；
+`DB_STOP_CMD`/`DB_START_CMD` 提供数据库停启命令以启用故障自闭用例。
 
 `scripts/dev-up.sh` / `scripts/app-restart.sh` 是在无 Docker 环境下复现同一拓扑
 （相同环境变量、`wal_level=logical`）的本地编排脚本，用于沙箱内自测。
@@ -74,3 +101,5 @@ WAL 增长、失败后可写）与 `tests/race_test.py`（续租/回收真并发
 - compose 中 `POSTGRES_HOST_AUTH_METHOD: trust` 仅为本地演示方便 `pg_recvlogical`，生产请移除。
 - 单操作者模型：多实例部署时并发回收仍安全（tombstone 原子、删后复核、误报回滚），
   但租约签发假定消费者只有一个持有者（演示场景）。
+- 软阈值是**准入控制**而非硬配额：越线的那一批仍被受理（受理时未达阈值），
+  其后的批次才被拒绝；阈值按代次生效，回收/重建后需重新设置。
